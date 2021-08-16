@@ -3,11 +3,17 @@ uuid = "274af599-196c-4de1-ad26-de7a66339f6a"
 authors = ["Colin Summers <me@colinxsummers.com> and contributors"]
 version = "0.1.0"
 
+[deps]
+JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
+UUIDs = "cf7118a7-6976-5b1a-9a39-7adc72f591a4"
+
 [compat]
+JSON = "0.20, 0.21"
 julia = "1.6"
 
 [extras]
+Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["Test"]
+test = ["Test", "Sockets"]

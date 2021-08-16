@@ -1,5 +1,7 @@
 module Stratum
 
-# Write your package code here.
+import JSON, UUIDs
+
+include("packagedef.jl")
 
 end
