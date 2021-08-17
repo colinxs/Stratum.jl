@@ -1,3 +1,6 @@
+abstract type AbstractMessageType <: AbstractDict{AbstractString,Any} end
+const MessageType = Dict{String,Any}
+
 struct StratumError <: Exception
     code::Int
     msg::AbstractString
@@ -5,31 +8,38 @@ struct StratumError <: Exception
 end
 
 function Base.showerror(io::IO, ex::StratumError)
-    error_code_as_string = if ex.code == -32700
-        "ParseError"
-    elseif ex.code == -32600
-        "InvalidRequest"
-    elseif ex.code == -32601
-        "MethodNotFound"
-    elseif ex.code == -32602
-        "InvalidParams"
-    elseif ex.code == -32603
-        "InternalError"
-    elseif ex.code == -32099
-        "serverErrorStart"
-    elseif ex.code == -32000
-        "serverErrorEnd"
-    elseif ex.code == -32002
-        "ServerNotInitialized"
-    elseif ex.code == -32001
-        "UnknownErrorCode"
-    elseif ex.code == -32800
-        "RequestCancelled"
-	elseif ex.code == -32801
-        "ContentModified"
-    else
-        "Unkonwn"
-    end
+    error_code_as_string =
+    # JSON RPC 2.0 Error Codes
+    # https://www.jsonrpc.org/specification#error_object
+        if ex.code == -32700
+            "ParseError"
+        elseif ex.code == -32600
+            "InvalidRequest"
+        elseif ex.code == -32601
+            "MethodNotFound"
+        elseif ex.code == -32602
+            "InvalidParams"
+        elseif ex.code == -32603
+            "InternalError"
+
+            # Stratum V1 Error Codes
+            # https://braiins.com/stratum-v1/docs
+        elseif ex.code == 20
+            "Unknown"
+        elseif ex.code == 21
+            "JobNotFound"
+        elseif ex.code == 22
+            "DuplicateShare"
+        elseif ex.code == 23
+            "LowDifficultyShare"
+        elseif ex.code == 24
+            "UnauthorizedWorker"
+        elseif ex.code == 25
+            "NotSubscribed"
+
+        else
+            "Unknown"
+        end
 
     print(io, error_code_as_string)
     print(io, ": ")
@@ -41,173 +51,180 @@ function Base.showerror(io::IO, ex::StratumError)
     end
 end
 
-mutable struct StratumEndpoint{IOIn <: IO,IOOut <: IO}
+mutable struct StratumEndpoint{IOIn<:IO,IOOut<:IO,MsgIn<:MessageType,MsgOut<:MessageType}
     pipe_in::IOIn
     pipe_out::IOOut
-
-    out_msg_queue::Channel{Any}
-    in_msg_queue::Channel{Any}
-
-    outstanding_requests::Dict{String,Channel{Any}}
 
     name::Union{Nothing,String}
 
     err_handler::Union{Nothing,Function}
 
+    msg_queue_in::Channel{MsgIn}
+    msg_queue_out::Channel{MsgOut}
+
+    outstanding_requests::Dict{String,Channel{MessageType}}
+
     status::Symbol
 
-    read_task::Union{Nothing,Task}
-    write_task::Union{Nothing,Task}
+    reader::Union{Nothing,Task}
+    writer::Union{Nothing,Task}
 end
 
-StratumEndpoint(pipe_in, pipe_out, name = nothing, err_handler = nothing) =
-    StratumEndpoint(pipe_in, pipe_out, Channel{Any}(Inf), Channel{Any}(Inf), Dict{String,Channel{Any}}(), name, err_handler, :idle, nothing, nothing)
-
-function write_transport_layer(stream, response)
-    @info "write_transport_layer" response
-    response_utf8 = transcode(UInt8, response)
-    write(stream, response_utf8, '\n')
-    flush(stream)
+function StratumEndpoint(pipe_in, pipe_out; name=nothing, err_handler=nothing)
+    return StratumEndpoint(
+        pipe_in,
+        pipe_out,
+        name,
+        err_handler,
+        Channel{MessageType}(Inf),
+        Channel{MessageType}(Inf),
+        Dict{String,Channel{MessageType}}(),
+        :idle,
+        nothing,
+        nothing,
+    )
 end
 
-function read_transport_layer(stream)
-    msg = chomp(readline(stream))
-    @info "read_transport_layer" msg
+
+Base.isopen(x::StratumEndpoint) = x.status === :running && iswritable(x) && isreadable(x) 
+
+function check_isopen(x::StratumEndpoint)
+    isopen(x) || error("Endpoint is not open") 
+    return nothing
+end
+
+Base.iswritable(x::StratumEndpoint) = isopen(x.msg_queue_out) && isopen(x.pipe_out)
+Base.isreadable(x::StratumEndpoint) = isopen(x.msg_queue_in)  && isopen(x.pipe_in)
+
+check_writable(x::StratumEndpoint) = iswritable(x) || error("Endpoint is not writable")
+check_readable(x::StratumEndpoint) = isreadable(x) || error("Endpoint is not readable")
+
+function Base.take!(x::StratumEndpoint)
+    check_isopen(x)
+    msg = take!(x.msg_queue_in)
     return msg
 end
 
-Base.isopen(x::StratumEndpoint) = x.status != :closed && isopen(x.pipe_in) && isopen(x.pipe_out)
-
-function Base.run(x::StratumEndpoint)
-    x.status == :idle || error("Endpoint is not idle.")
-
-    x.write_task = @async try
-        try
-            for msg in x.out_msg_queue
-                if isopen(x.pipe_out)
-                    @info "Sent message $(x.name):" msg 
-                    write_transport_layer(x.pipe_out, msg)
-                else
-                    # TODO Reconsider at some point whether this should be treated as an error.
-                    break
-                end
-            end
-        finally
-            @info "CLOSE"
-            close(x.out_msg_queue)
-        end
-    catch err
-        bt = catch_backtrace()
-        if x.err_handler !== nothing
-            x.err_handler(err, bt)
-        else
-            Base.display_error(stderr, err, bt)
-        end
-    end
-
-    x.read_task = @async try
-        try
-            while true
-                message = read_transport_layer(x.pipe_in)
-
-                if message === nothing || x.status == :closed
-                    break
-                end
-
-                # @info "Received message $(x.name):" message
-                message_dict = JSON.parse(message)
-                id = get(message_dict, "id", nothing)
-                if haskey(x.outstanding_requests, id)
-                    channel_for_response = x.outstanding_requests[id]
-                    put!(channel_for_response, message_dict)
-                    delete!(channel_for_response, id)
-                else
-                    try
-                        put!(x.in_msg_queue, message_dict)
-                    catch err
-                        if err isa InvalidStateException
-                            break
-                        else
-                            rethrow(err)
-                        end
-                    end
-                end
-            end
-        finally
-            close(x.in_msg_queue)
-        end
-    catch err
-        bt = catch_backtrace()
-        if x.err_handler !== nothing
-            x.err_handler(err, bt)
-        else
-            Base.display_error(stderr, err, bt)
-        end
-    end
-
-    x.status = :running
+function Base.put!(x::StratumEndpoint, msg::AbstractDict)
+    check_isopen(x)
+    put!(x.msg_queue_out, msg) 
+    return x 
 end
 
+function write_transport_layer(x::StratumEndpoint, msg::AbstractString)
+    msg_utf8 = transcode(UInt8, msg)
+    n = write(x.pipe_out, msg_utf8, '\n')
+    flush(x.pipe_out)
+    return n
+end
+
+function read_transport_layer(x::StratumEndpoint) 
+    msg = chomp(readline(x.pipe_in))
+    return msg
+end
+
+
+function Base.run(x::StratumEndpoint)
+    x.status == :idle   || error("Endpoint is not idle.")
+    x.status == :closed && error("Endpoint is closed.")
+
+    x.status = :running
+
+    x.writer = @async try
+        try
+            while true
+                msg = take!(x.msg_queue_out)
+                isopen(x) || break
+                write_transport_layer(x, JSON.json(msg))
+                x.name === nothing ? (@debug "Sent:" msg) : (@debug "Sent ($(x.name)):" msg)
+            end
+        finally
+            x.name === nothing ? (@debug "Closed") : (@debug "Closed ($(x.name)):")
+            close(x.msg_queue_out)
+            close(x.pipe_out)
+        end
+    catch err
+        bt = catch_backtrace()
+        handle_error(x, err, bt)
+    end
+
+    x.reader = @async try
+        try
+            while true
+                msg_raw = read_transport_layer(x) 
+                (isopen(x) && !isempty(msg_raw)) || break
+
+                msg = JSON.parse(msg_raw)
+                x.name === nothing ? (@debug "Received:" msg) : (@debug "Received ($(x.name)):" msg)
+
+                id = get(msg, "id", nothing)
+                if haskey(x.outstanding_requests, id)
+                    put!(x.outstanding_requests[id], msg)
+                else
+                    put!(x.msg_queue_in, msg)
+                end
+            end
+        finally
+            x.name === nothing ? (@debug "Closed") : (@debug "Closed ($(x.name)):")
+            close(x.msg_queue_in)
+            close(x.pipe_in)
+        end
+    catch err
+        bt = catch_backtrace()
+        handle_error(x, err, bt)
+    end
+
+    return x
+end
+
+function handle_error(x::StratumEndpoint, err, bt)
+    if x.err_handler !== nothing
+        x.err_handler(err, bt)
+    else
+        Base.display_error(stderr, err, bt)
+    end
+end
+
+
 function send_notification(x::StratumEndpoint, method::AbstractString, params)
-    check_dead_endpoint!(x)
+    check_isopen(x)
 
-    message = Dict("jsonrpc" => "2.0", "method" => method, "params" => params)
+    msg = Dict("jsonrpc" => "2.0", "method" => method, "params" => params)
 
-    message_json = JSON.json(message)
-
-    put!(x.out_msg_queue, message_json)
+    put!(x, msg)
 
     return nothing
 end
 
 function send_request(x::StratumEndpoint, method::AbstractString, params)
-    check_dead_endpoint!(x)
+    check_isopen(x)
 
     id = string(UUIDs.uuid4())
-    message = Dict("jsonrpc" => "2.0", "method" => method, "params" => params, "id" => id)
+    msg = Dict("jsonrpc" => "2.0", "id" => id, "method" => method, "params" => params)
 
-    response_channel = Channel{Any}(1)
-    x.outstanding_requests[id] = response_channel
+    x.outstanding_requests[id] = Channel{MessageType}(1)
 
-    message_json = JSON.json(message)
+    put!(x, msg)
 
-    put!(x.out_msg_queue, message_json)
-
-    response = take!(response_channel)
+    response = take!(x.outstanding_requests[id])
+    delete!(x.outstanding_requests, id)
 
     if haskey(response, "result")
-        return response["result"]
+        # TODO which makes the most sense?
+        # return response["result"]
+        return response
     elseif haskey(response, "error")
-        error_code = response["error"]["code"]
-        error_msg = response["error"]["message"]
-        error_data = get(response["error"], "data", nothing)
-        throw(StratumError(error_code, error_msg, error_data))
+        err_code, err_msg, err_data = response["error"]
+        throw(StratumError(err_code, err_msg, err_data))
     else
         throw(StratumError(0, "ERROR AT THE TRANSPORT LEVEL", nothing))
     end
 end
 
-function get_next_message(endpoint::StratumEndpoint)
-    check_dead_endpoint!(endpoint)
-
-    msg = take!(endpoint.in_msg_queue)
-
-    return msg
-end
-
-function put_message!(endpoint::StratumEndpoint, msg)
-    check_dead_endpoint!(endpoint)
-
-    put!(endpoint.out_msg_queue, JSON.json(msg))
-
-    return endpoint 
-end
-
-function Base.iterate(endpoint::StratumEndpoint, state = nothing)
-    check_dead_endpoint!(endpoint)
-
+function Base.iterate(x::StratumEndpoint, state=nothing)
+    check_isopen(x)
     try
-        return take!(endpoint.in_msg_queue), nothing
+        return take!(x), nothing
     catch err
         if err isa InvalidStateException
             return nothing
@@ -217,88 +234,42 @@ function Base.iterate(endpoint::StratumEndpoint, state = nothing)
     end
 end
 
-function send_success_response(endpoint, original_request, result)
-    check_dead_endpoint!(endpoint)
-
-    response = Dict("jsonrpc" => "2.0", "id" => original_request["id"], "result" => result)
-
-    response_json = JSON.json(response)
-
-    put!(endpoint.out_msg_queue, response_json)
+function send_success_response(x, original_request, result)
+    msg = Dict("jsonrpc" => "2.0", "id" => original_request["id"], "result" => result)
+    return put!(x, msg)
 end
 
-function send_error_response(endpoint, original_request, code, message, data)
-    check_dead_endpoint!(endpoint)
-
-    response = Dict("jsonrpc" => "2.0", "id" => original_request["id"], "error" => Dict("code" => code, "message" => message, "data" => data))
-
-    response_json = JSON.json(response)
-
-    put!(endpoint.out_msg_queue, response_json)
+function send_error_response(x, original_request, err_code, err_msg, err_data)
+    msg = Dict(
+        "jsonrpc" => "2.0",
+        "id" => original_request["id"],
+        "error" => [err_code, err_msg, err_data],
+    )
+    return put!(x, msg)
 end
 
-function Base.close(endpoint::StratumEndpoint)
-    flush(endpoint)
+function Base.close(x::StratumEndpoint)
+    flush(x)
 
-    endpoint.status = :closed
-    isopen(endpoint.in_msg_queue) && close(endpoint.in_msg_queue)
-    isopen(endpoint.out_msg_queue) && close(endpoint.out_msg_queue)
+    x.status = :closed
 
-    fetch(endpoint.write_task)
-    # TODO we would also like to close the read Task
-    # But unclear how to do that without also closing
-    # the socket, which we don't want to do
-    # fetch(endpoint.read_task)
+    close(x.msg_queue_in)
+    close(x.msg_queue_out)
+
+    close(x.pipe_in)
+    close(x.pipe_out)
+
+    fetch(x.writer)
+    fetch(x.reader)
+
+    return nothing
 end
 
-function Base.flush(endpoint::StratumEndpoint)
-    check_dead_endpoint!(endpoint)
+function Base.flush(x::StratumEndpoint)
+    check_isopen(x)
 
-    while isready(endpoint.out_msg_queue)
+    while isready(x.msg_queue_out)
         yield()
     end
 end
 
-function check_dead_endpoint!(endpoint)
-    status = endpoint.status
-    status === :running && return
-    error("Endpoint is not running, the current state is $(status).")
-end
-
-
-struct StratumProxy
-    from::StratumEndpoint
-    to::StratumEndpoint
-    
-    err_handler::Union{Nothing,Function}
-    
-    msg_queue::Channel{Any}
-
-    status::Symbol
-
-    task::Union{Nothing,Task}
-end
-StratumProxy(from, to, err_handler = nothing) = StratumProxy(from, to, err_handler, Channel{Any}(Inf), :idle, nothing)
-
-
-function Base.run(x::StratumProxy)
-    x.status == :idle || error("Proxy is not idle.")
-    x.task = @async try
-        try
-            while true
-                msg = get_next_message(x.from)
-                put!(x.msg_queue, msg)
-                put_message!(x.to, msg)
-            end
-        finally
-            close(x.msg_queue)
-        end
-    catch err
-        bt = catch_backtrace()
-        if x.err_handler !== nothing
-            x.err_handler(err, bt)
-        else
-            Base.display_error(stderr, err, bt)
-        end
-    end
-end
